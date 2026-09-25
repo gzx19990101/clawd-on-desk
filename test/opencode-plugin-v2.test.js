@@ -362,6 +362,31 @@ describe("opencode plugin V2 entry (permission contract)", () => {
     await cleanup();
   });
 
+  it("maps every idle signal to the turn boundary and dedups duplicates", async () => {
+    const instance = makeV2Ctx("C:\\proj");
+    const cleanup = await entry.setup(instance.ctx);
+
+    instance.push({
+      type: "session.tool.called",
+      data: { sessionID: "ses_idle", assistantMessageID: "msg_idle", id: "call_idle", input: {}, executed: false },
+    });
+    // V2 may deliver completion as status-idle, execution.succeeded, or
+    // session.idle — all three must reach the core's turn boundary, and the
+    // duplicates must collapse to a single Stop.
+    instance.push({ type: "session.status", data: { sessionID: "ses_idle", status: { type: "idle" } } });
+    instance.push({ type: "session.execution.succeeded", data: { sessionID: "ses_idle" } });
+    instance.push({ type: "session.idle", data: { sessionID: "ses_idle" } });
+
+    await waitUntil(() => stateEvents("ses_idle", "Stop").length > 0, "Stop never sent");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.strictEqual(
+      stateEvents("ses_idle", "Stop").length,
+      1,
+      "duplicate idle signals must collapse to one turn boundary"
+    );
+    await cleanup();
+  });
+
   it("keeps the V1 object entrypoint wired to the same core", async () => {
     const hooks = await entry.server({ directory: "C:\\proj", client: {} });
     assert.strictEqual(typeof hooks.event, "function");

@@ -95,7 +95,18 @@ function createEventAdapter() {
         remember(data);
         return { type: "session.updated", properties: { sessionID: data.sessionID, info: info(data.sessionID) } };
       case "session.status":
+        // The core turns V1 session.idle into the turn boundary (Stop for
+        // root sessions, SessionEnd for children) and ignores status-idle as
+        // redundant. V2 may deliver completion only as status-idle or as
+        // execution.succeeded, so surface every idle signal as session.idle;
+        // the core's same-state dedup absorbs duplicates.
+        if (data.status && data.status.type === "idle") {
+          return { type: "session.idle", properties: { sessionID: data.sessionID } };
+        }
         return { type: "session.status", properties: { sessionID: data.sessionID, status: data.status } };
+      case "session.execution.succeeded":
+      case "session.execution.interrupted":
+        return { type: "session.idle", properties: { sessionID: data.sessionID } };
       case "session.idle":
         return { type: "session.idle", properties: { sessionID: data.sessionID } };
       case "session.execution.failed":
