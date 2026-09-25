@@ -507,6 +507,14 @@ export function createOpencodeFamilyPlugin(config) {
   // cannot cancel a live promise, so tails remove themselves only after
   // settlement and only when their identity is still current.
   const _permissionPostTailByRequestId = new Map();
+  // OpenCode V2 loads one plugin instance per location and fans every event
+  // out to all of them, so the same permission.asked arrives once per
+  // instance. A request must produce exactly ONE Clawd bubble: the first
+  // delivery owns it and later duplicates are dropped. Completion delivery
+  // stays untouched — a duplicate permission.replied is an idempotent cleanup
+  // delivery by contract (see opencode-family-bridge.test.js).
+  const _permissionAskedSeen = new Set();
+  const PERMISSION_SEEN_LIMIT = 256;
   // Reverse bridge state. Set by startBridge() at plugin init. Clawd receives
   // _bridgeUrl + _bridgeToken with every /permission forward and POSTs back.
   let _bridgeUrl = "";
@@ -2071,6 +2079,17 @@ export function createOpencodeFamilyPlugin(config) {
   // _lastSeenSessionId → _rootSessionId fallback.
   // Phase 1 dedup/state machine logic does not run for permission events — they
   // ride a parallel channel and never translate to a Clawd state transition.
+  // Bound the duplicate-ask memory without deleting history: entries only
+  // matter while a request is pending or shortly after it was resolved, so
+  // dropping the oldest past the cap cannot resurrect a bubble.
+  function rememberPermissionEvent(seen, requestId) {
+    seen.add(requestId);
+    if (seen.size > PERMISSION_SEEN_LIMIT) {
+      const oldest = seen.values().next().value;
+      if (oldest) seen.delete(oldest);
+    }
+  }
+
   function handlePermissionAsked(event, instance) {
     const p = (event && event.properties) || {};
     const requestId = p.id;
@@ -2078,6 +2097,11 @@ export function createOpencodeFamilyPlugin(config) {
       debugLog(`PERM skip: no request id in permission.asked`);
       return;
     }
+    if (_permissionAskedSeen.has(requestId)) {
+      debugLog(`PERM skip duplicate ask req=${boundedPermissionRequestId(requestId)}`);
+      return;
+    }
+    rememberPermissionEvent(_permissionAskedSeen, requestId);
     const sessionId = resolveSessionId(
       getEventSessionId(event),
       _lastSeenSessionId || _rootSessionId
