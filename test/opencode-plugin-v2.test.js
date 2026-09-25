@@ -337,29 +337,37 @@ describe("opencode plugin V2 entry (permission contract)", () => {
     await cleanup();
   });
 
-  it("delivers one PreToolUse/PostToolUse state POST per tool call", async () => {
-    const instance = makeV2Ctx("C:\\proj");
-    const cleanup = await entry.setup(instance.ctx);
+  it("delivers one PreToolUse/PostToolUse state POST per tool call across instances", async () => {
+    // The core's tool identity dedup must collapse the fan-out: every plugin
+    // instance observes the same tool event, and recap counts the POSTs.
+    const a = makeV2Ctx("C:\\proj");
+    const b = makeV2Ctx("C:\\proj");
+    const cleanupA = await entry.setup(a.ctx);
+    const cleanupB = await entry.setup(b.ctx);
 
     for (const id of ["call_count_a", "call_count_b"]) {
-      instance.push({
-        type: "session.tool.called",
-        data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, input: {}, executed: false },
-      });
-      instance.push({
-        type: "session.tool.success",
-        data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, content: [], executed: false },
-      });
+      for (const instance of [a, b]) {
+        instance.push({
+          type: "session.tool.called",
+          data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, input: {}, executed: false },
+        });
+        instance.push({
+          type: "session.tool.success",
+          data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, content: [], executed: false },
+        });
+      }
     }
 
-    await waitUntil(() => stateEvents("ses_count", "PostToolUse").length >= 2, "tool state POSTs missing");
+    await waitUntil(() => stateEvents("ses_count", "PostToolUse").length >= 1, "tool state POSTs missing");
+    await new Promise((resolve) => setTimeout(resolve, 30));
     assert.strictEqual(
       stateEvents("ses_count", "PreToolUse").length,
       2,
-      "repeated working states must not dedup recap tool-call signals"
+      "each call posts exactly one PreToolUse no matter how many instances observe it"
     );
     assert.strictEqual(stateEvents("ses_count", "PostToolUse").length, 2);
-    await cleanup();
+    await cleanupA();
+    await cleanupB();
   });
 
   it("maps every idle signal to the turn boundary and dedups duplicates", async () => {

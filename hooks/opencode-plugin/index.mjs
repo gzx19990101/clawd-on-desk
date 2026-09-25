@@ -17,14 +17,27 @@
 // context, so setup() rebuilds the V1 shapes the core consumes and hands it
 // the same handlers it has always run.
 
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createOpencodeFamilyPlugin } from "../opencode-family-plugin/core.mjs";
 
-const plugin = createOpencodeFamilyPlugin({
+// OpenCode loads the plugin once per location and may evaluate this module
+// more than once per process. The core's handler state (per-session dedup,
+// POST queues, the reverse bridge) is designed to be shared across all
+// instances of ONE core revision — without it every evaluation posts its own
+// copy of every state and the app receives racing duplicate streams. The key
+// includes a content hash of core.mjs so an updated core starts a fresh
+// product instead of silently reusing stale code from a previous load.
+const coreRevision = createHash("sha256")
+  .update(readFileSync(new URL("../opencode-family-plugin/core.mjs", import.meta.url)))
+  .digest("hex")
+  .slice(0, 16);
+const plugin = (globalThis[Symbol.for(`clawd.opencode-family.core.${coreRevision}`)] ??= createOpencodeFamilyPlugin({
   agentId: "opencode",
   hookSource: "opencode-plugin",
   logFileName: "opencode-plugin.log",
   sessionIdPrefix: "opencode:",
-});
+}));
 
 // V1 message shape used by the core's context-usage hydration: it reads
 // message.info.{id,sessionID,role,time.created,tokens} only.
@@ -119,17 +132,17 @@ function createEventAdapter() {
         rememberBounded(toolInputs, data.id, data.input);
         return {
           type: "message.part.updated",
-          properties: { sessionID: data.sessionID, part: { type: "tool", state: { status: "running" } } },
+          properties: { sessionID: data.sessionID, part: { id: data.id, type: "tool", state: { status: "running" } } },
         };
       case "session.tool.success":
         return {
           type: "message.part.updated",
-          properties: { sessionID: data.sessionID, part: { type: "tool", state: { status: "completed" } } },
+          properties: { sessionID: data.sessionID, part: { id: data.id, type: "tool", state: { status: "completed" } } },
         };
       case "session.tool.failed":
         return {
           type: "message.part.updated",
-          properties: { sessionID: data.sessionID, part: { type: "tool", state: { status: "error" } } },
+          properties: { sessionID: data.sessionID, part: { id: data.id, type: "tool", state: { status: "error" } } },
         };
       case "session.step.ended": {
         // V2 splits usage reporting: session.step.ended carries the tokens of

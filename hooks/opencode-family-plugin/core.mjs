@@ -1481,7 +1481,26 @@ export function createOpencodeFamilyPlugin(config) {
   // reusable across agents.
   const TOOL_LIFECYCLE_EVENTS = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
 
-  function sendState(state, eventName, sessionId) {
+  // Bounded memory of delivered tool lifecycle identities. Plugin instances
+  // (and plugin reloads) share this closure state, so exactly one POST per
+  // (call, phase) reaches /state no matter how many of them observe the
+  // event — recap counts tool calls from these POSTs.
+  const _toolEventSeen = new Set();
+  const TOOL_EVENT_SEEN_LIMIT = 512;
+
+  function toolEventIdentity(part, phase) {
+    return part && typeof part.id === "string" && part.id ? `${part.id}\0${phase}` : null;
+  }
+
+  function rememberToolEventKey(key) {
+    _toolEventSeen.add(key);
+    if (_toolEventSeen.size > TOOL_EVENT_SEEN_LIMIT) {
+      const oldest = _toolEventSeen.values().next().value;
+      if (oldest) _toolEventSeen.delete(oldest);
+    }
+  }
+
+  function sendState(state, eventName, sessionId, identity = null) {
     const body = buildStateBody(state, eventName, sessionId);
     if (!body) return;
 
@@ -1490,8 +1509,15 @@ export function createOpencodeFamilyPlugin(config) {
     // Per-session dedup: skip only if the SAME session repeats the SAME state.
     // Tool lifecycle events are data, not visuals — recap counts tool calls
     // from them (src/recap-metrics.js) and parallel tools repeat the same
-    // working state — so they are exempt and always reach /state.
-    if (body.state === lastState && !TOOL_LIFECYCLE_EVENTS.has(body.event)) {
+    // working state — so they bypass the state dedup but are delivered once
+    // per (call, phase) identity instead.
+    if (TOOL_LIFECYCLE_EVENTS.has(body.event)) {
+      if (identity) {
+        const key = `${body.session_id}\0${identity}`;
+        if (_toolEventSeen.has(key)) return;
+        rememberToolEventKey(key);
+      }
+    } else if (body.state === lastState) {
       return;
     }
 
@@ -1532,9 +1558,9 @@ export function createOpencodeFamilyPlugin(config) {
           // pending → running → completed fires back-to-back; dedup absorbs the
           // repeat so only the first transition actually POSTs.
           const status = part.state && part.state.status;
-          if (status === "running") return { state: "working", event: "PreToolUse" };
-          if (status === "completed") return { state: "working", event: "PostToolUse" };
-          if (status === "error") return { state: "error", event: "PostToolUseFailure" };
+          if (status === "running") return { state: "working", event: "PreToolUse", identity: toolEventIdentity(part, "running") };
+          if (status === "completed") return { state: "working", event: "PostToolUse", identity: toolEventIdentity(part, "completed") };
+          if (status === "error") return { state: "error", event: "PostToolUseFailure", identity: toolEventIdentity(part, "error") };
           return null;
         }
 
@@ -2608,7 +2634,7 @@ export function createOpencodeFamilyPlugin(config) {
           );
 
           debugLog(`MAP ${event.type} → state=${mapped.state} event=${mapped.event}`);
-          sendState(mapped.state, mapped.event, sessionId);
+          sendState(mapped.state, mapped.event, sessionId, mapped.identity);
           // Unified cleanup happens only after postStateToClawd synchronously
           // snapshots the final SessionEnd body. This preserves cwd, title and
           // child/headless ownership while the queued network delivery waits.
