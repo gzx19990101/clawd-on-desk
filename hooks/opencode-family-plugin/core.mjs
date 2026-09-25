@@ -1213,9 +1213,12 @@ export function createOpencodeFamilyPlugin(config) {
 
   function isReplaceableStateSnapshot(snapshot) {
     const body = snapshot && snapshot.body;
+    // Replaceable = visual-only repeats a newer snapshot can supersede. Tool
+    // lifecycle events are deliberately absent: coalescing them would silently
+    // drop tool calls that recap counts (see TOOL_LIFECYCLE_EVENTS).
     return !!body
       && body.metadata_only !== true
-      && ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"].includes(body.event);
+      && ["UserPromptSubmit", "PreCompact"].includes(body.event);
   }
 
   function isMetadataStateSnapshot(snapshot) {
@@ -1476,6 +1479,8 @@ export function createOpencodeFamilyPlugin(config) {
   // Clawd uses PascalCase event names matching Claude Code's hook vocabulary so
   // state.js transition rules (e.g. SubagentStop → working whitelist) are
   // reusable across agents.
+  const TOOL_LIFECYCLE_EVENTS = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
+
   function sendState(state, eventName, sessionId) {
     const body = buildStateBody(state, eventName, sessionId);
     if (!body) return;
@@ -1483,7 +1488,10 @@ export function createOpencodeFamilyPlugin(config) {
     const lastState = _lastStatePerSession.get(body.session_id) || null;
 
     // Per-session dedup: skip only if the SAME session repeats the SAME state.
-    if (body.state === lastState) {
+    // Tool lifecycle events are data, not visuals — recap counts tool calls
+    // from them (src/recap-metrics.js) and parallel tools repeat the same
+    // working state — so they are exempt and always reach /state.
+    if (body.state === lastState && !TOOL_LIFECYCLE_EVENTS.has(body.event)) {
       return;
     }
 

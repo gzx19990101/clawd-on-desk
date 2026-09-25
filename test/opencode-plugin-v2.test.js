@@ -153,6 +153,15 @@ function contextUsagePosts(sessionId) {
   ));
 }
 
+function stateEvents(sessionId, event) {
+  return fetchCalls.filter((call) => (
+    call.body
+    && call.body.event === event
+    && call.body.metadata_only !== true
+    && call.body.session_id === `opencode:${sessionId}`
+  ));
+}
+
 describe("opencode plugin V2 entry (permission contract)", () => {
   it("maps V2 permission.asked onto the V1 ask contract with the referenced tool input", async () => {
     const instance = makeV2Ctx("C:\\proj");
@@ -325,6 +334,31 @@ describe("opencode plugin V2 entry (permission contract)", () => {
       before,
       "cumulative billing totals must never reach context usage"
     );
+    await cleanup();
+  });
+
+  it("delivers one PreToolUse/PostToolUse state POST per tool call", async () => {
+    const instance = makeV2Ctx("C:\\proj");
+    const cleanup = await entry.setup(instance.ctx);
+
+    for (const id of ["call_count_a", "call_count_b"]) {
+      instance.push({
+        type: "session.tool.called",
+        data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, input: {}, executed: false },
+      });
+      instance.push({
+        type: "session.tool.success",
+        data: { sessionID: "ses_count", assistantMessageID: "msg_count", id, content: [], executed: false },
+      });
+    }
+
+    await waitUntil(() => stateEvents("ses_count", "PostToolUse").length >= 2, "tool state POSTs missing");
+    assert.strictEqual(
+      stateEvents("ses_count", "PreToolUse").length,
+      2,
+      "repeated working states must not dedup recap tool-call signals"
+    );
+    assert.strictEqual(stateEvents("ses_count", "PostToolUse").length, 2);
     await cleanup();
   });
 
