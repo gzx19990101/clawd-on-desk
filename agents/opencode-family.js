@@ -44,6 +44,12 @@ const OPENCODE_FAMILY = Object.freeze({
     configCandidates: Object.freeze(["opencode.jsonc", "opencode.json", "config.json"]),
     jsonc: true,
     schema: "https://opencode.ai/config.json",
+    // The entry's default-export contract, pinned per member because the
+    // hosts' loaders differ: OpenCode V2 requires a { id, setup } definition
+    // object (and rejects function defaults) while V1 >= 1.18.29 consumes
+    // the same object through server(). MiMo's loader still requires the
+    // legacy function export — see test/opencode-family-core.test.js.
+    pluginEntry: "v2-definition",
     // #1026: register a user-writable, content-addressed managed generation
     // under the target home instead of pointing opencode at the packaged
     // source dir (Program Files / app.asar.unpacked paths are silently
@@ -77,6 +83,9 @@ const OPENCODE_FAMILY = Object.freeze({
     configCandidates: Object.freeze(["mimocode.jsonc", "mimocode.json", "config.json"]),
     jsonc: true,
     schema: "https://mimo.xiaomi.com/mimocode/config.json",
+    // MiMo's loader iterates the entry namespace and requires the legacy
+    // function export (#413) — it cannot load the V2 definition object.
+    pluginEntry: "legacy-function",
     // MiMo keeps the legacy direct-source register/unregister/Doctor behavior
     // in this change (#1026 §1.2). Flipping this to true requires real MiMo
     // loader evidence and explicit review authorization.
