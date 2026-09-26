@@ -493,29 +493,50 @@ describe("opencode v2 review follow-ups", () => {
   it("restores parent identity for a recovered child session without a lifecycle", async (t) => {
     const fetchStub = stubFetch(t);
     const { def } = await makeDefinition();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
     const { ctx } = v2Ctx({
       session: {
-        get: async () => ({ parentID: "ses_parent", title: "Child", location: { directory: "C:/proj" } }),
+        get: async () => {
+          await gate;
+          return { parentID: "ses_parent", title: "Child", location: { directory: "C:/proj" } };
+        },
       },
     });
     const cleanup = await def.setup(ctx);
     t.after(cleanup);
 
+    // Both tool calls arrive while the lookup is still pending: they must be
+    // staged rather than reported as root (the old test slept between them,
+    // which hid this race).
     def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_child", id: "call_c1" } });
-    await tick(40);
     def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_child", id: "call_c2" } });
-    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: "ses_child" } });
-    await tick(60);
-
-    const posts = fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_child");
-    assert.ok(
-      posts.some((c) => c.body.event === "PreToolUse" && c.body.headless === true),
-      "recovered child reports headless"
+    await tick(20);
+    assert.strictEqual(
+      fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_child").length,
+      0,
+      "no identity-dependent report before hydration resolves"
     );
-    assert.ok(posts.some((c) => c.body.event === "SessionEnd"), "child completion is a SessionEnd");
-    assert.ok(!posts.some((c) => c.body.event === "Stop"), "child completion is never a root Stop");
-    assert.ok(!posts.some((c) => c.body.event === "SessionStart"), "hydration invents no lifecycle");
-    assert.ok(posts.some((c) => c.body.session_title === "Child"), "hydrated title reaches metadata");
+
+    release();
+    await tick(40);
+    // A turn end after hydration still carries the recovered child classification.
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: "ses_child" } });
+    await tick(40);
+
+    const posted = fetchStub.calls
+      .filter((c) => c.body && c.body.session_id === "opencode:ses_child")
+      .map((c) => c.body);
+    const lifecycle = posted.filter((b) => b.event !== "SessionUpdate");
+    assert.deepStrictEqual(
+      lifecycle.map((b) => b.event),
+      ["PreToolUse", "PreToolUse", "SessionEnd"],
+      "each staged tool call replays exactly once; child completion is a SessionEnd"
+    );
+    for (const body of lifecycle) assert.strictEqual(body.headless, true, "every child report stays headless");
+    assert.ok(!lifecycle.some((b) => b.event === "Stop"), "child completion is never a root Stop");
+    assert.ok(!lifecycle.some((b) => b.event === "SessionStart"), "hydration invents no lifecycle");
+    assert.ok(posted.some((b) => b.event === "SessionUpdate" && b.session_title === "Child"), "hydrated title reaches metadata");
   });
 
   it("keeps other sessions flowing while one identity lookup hangs", async (t) => {
@@ -652,6 +673,346 @@ describe("opencode v2 review follow-ups", () => {
       /EVENT stream aborted by dispose/
     );
     assert.deepStrictEqual(rejections, [], "stream failures must not become unhandled rejections");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1053 review: recovered-child identity hydration vs lifecycle dispatch.
+// A recovered session's first events race the async ctx.session.get lookup. If
+// they are dispatched before it settles, a child's tool call becomes a root
+// PreToolUse and its turn end a root Stop, so HUD, completion and recap
+// over-report. These lock the staging/replay contract.
+// ---------------------------------------------------------------------------
+
+function deferredLookup() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+describe("opencode v2 recovered-child identity race", () => {
+  it("stages a recovered child's tool + turn end until identity resolves", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_race";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_race" } });
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: sid } });
+    await tick(20);
+    assert.strictEqual(
+      fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}`).length,
+      0,
+      "nothing is posted for the session before hydration resolves"
+    );
+
+    gate.resolve({ parentID: "ses_root", title: "Recovered", location: { directory: "/tmp/child" } });
+    await tick(40);
+
+    const posted = fetchStub.calls
+      .filter((c) => c.body && c.body.session_id === `opencode:${sid}`)
+      .map((c) => c.body);
+    const pres = posted.filter((b) => b.event === "PreToolUse");
+    assert.strictEqual(pres.length, 1, "PreToolUse replays exactly once");
+    assert.strictEqual(pres[0].headless, true);
+    assert.strictEqual(pres[0].cwd, "/tmp/child", "hydrated cwd reaches the replayed event");
+    assert.strictEqual(posted.filter((b) => b.event === "Stop").length, 0, "no root Stop");
+    assert.strictEqual(posted.filter((b) => b.event === "SessionEnd").length, 1, "exactly one SessionEnd");
+    const end = posted.find((b) => b.event === "SessionEnd");
+    assert.strictEqual(end.headless, true);
+    assert.strictEqual(end.state, "sleeping");
+  });
+
+  it("treats a child's first immediate turn end as SessionEnd", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({ session: { get: async () => ({ parentID: "ses_root" }) } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    // The lookup resolves on its own but never before this synchronous event.
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: "ses_immediate" } });
+    def.__test.handleV2Event({ type: "session.step.ended", data: { sessionID: "ses_step", finish: "stop" } });
+    await tick(40);
+
+    for (const sid of ["ses_immediate", "ses_step"]) {
+      const posted = fetchStub.calls
+        .filter((c) => c.body && c.body.session_id === `opencode:${sid}`)
+        .map((c) => c.body);
+      assert.strictEqual(posted.filter((b) => b.event === "Stop").length, 0, `${sid}: never a root Stop`);
+      assert.strictEqual(posted.filter((b) => b.event === "SessionEnd").length, 1, `${sid}: one SessionEnd`);
+    }
+  });
+
+  it("replays staged events as root in order when hydration fails", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_failopen";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_fo" } });
+    def.__test.handleV2Event({ type: "session.tool.success", data: { sessionID: sid, id: "call_fo" } });
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: sid } });
+    gate.reject(new Error("lookup down"));
+    await tick(40);
+
+    const posted = fetchStub.calls
+      .filter((c) => c.body && c.body.session_id === `opencode:${sid}`)
+      .map((c) => c.body);
+    assert.deepStrictEqual(posted.map((b) => b.event), ["PreToolUse", "PostToolUse", "Stop"]);
+    for (const body of posted) assert.notStrictEqual(body.headless, true, "failed lookup fails open as root");
+  });
+
+  it("does not let a hung child lookup delay another session", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const hung = deferredLookup();
+    const { ctx } = v2Ctx({
+      session: { get: async (input) => (input.sessionID === "ses_hung2" ? hung.promise : {}) },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_hung2", id: "call_h2" } });
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_free2", id: "call_f2" } });
+    await tick(40);
+
+    const free = fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_free2");
+    assert.strictEqual(free.length, 1, "the unrelated session is not held back");
+    assert.strictEqual(free[0].body.event, "PreToolUse");
+    assert.strictEqual(
+      fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_hung2").length,
+      0,
+      "the hung session stays staged"
+    );
+  });
+
+  it("hard-caps staged identity events with an explicit drop-oldest overflow", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_capped";
+    const cap = def.__test._identityPendingMax;
+
+    for (let i = 0; i < cap + 5; i += 1) {
+      def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: `call_cap_${i}` } });
+    }
+    const staged = def.__test._pendingIdentityBySession.get(`opencode:${sid}`);
+    assert.strictEqual(staged.length, cap, "staged queue is hard-bounded");
+    assert.strictEqual(staged[0].mapped.identity, "call_cap_5\u0000running", "overflow drops the oldest");
+
+    gate.resolve({});
+    await tick(60);
+    assert.strictEqual(def.__test._pendingIdentityBySession.has(`opencode:${sid}`), false, "staging drains");
+    assert.ok(fetchStub.calls.some((c) => c.body && c.body.session_id === `opencode:${sid}`));
+  });
+
+  it("lets a live session.created supersede a late recovery lookup", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_live";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_live" } });
+    // Live creation arrives before the stale lookup resolves: it is authoritative.
+    def.__test.handleV2Event({ type: "session.created", data: { sessionID: sid } });
+    await tick(20);
+    const pre = fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}` && c.body.event === "PreToolUse");
+    assert.strictEqual(pre.length, 1);
+    assert.notStrictEqual(pre[0].body.headless, true, "flushed with the live root classification");
+
+    gate.resolve({ parentID: "ses_parent" });
+    await tick(40);
+    assert.strictEqual(
+      def.__test._sessionParentById.has(`opencode:${sid}`),
+      false,
+      "a stale lookup must not set a parent after a live creation"
+    );
+  });
+
+  it("replays a duplicate staged tool event exactly once", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_dup";
+    const duplicate = { type: "session.tool.called", data: { sessionID: sid, id: "call_dup9" } };
+    def.__test.handleV2Event(duplicate);
+    def.__test.handleV2Event(duplicate);
+    gate.resolve({ parentID: "ses_parent" });
+    await tick(40);
+    const pres = fetchStub.calls.filter(
+      (c) => c.body && c.body.session_id === `opencode:${sid}` && c.body.event === "PreToolUse"
+    );
+    assert.strictEqual(pres.length, 1);
+  });
+
+  it("rehydrates after dispose even when the pending lookup staged nothing", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const sid = "ses_rehydrate";
+
+    // An ignored/metadata-only event opens a lookup but stages no mapped event.
+    const cleanup1 = await def.setup({ app: {}, session: { get: () => new Promise(() => {}) } });
+    def.__test.handleV2Event({ type: "session.usage.updated", data: { sessionID: sid } });
+    await tick(20);
+    assert.strictEqual(def.__test._hydrationState.get(`opencode:${sid}`), "pending");
+    assert.deepStrictEqual(def.__test._pendingIdentityBySession.get(`opencode:${sid}`), []);
+
+    // Dispose must clear the pending state even though the queue is empty.
+    await cleanup1();
+    assert.strictEqual(def.__test._hydrationState.has(`opencode:${sid}`), false, "pending state is cleared");
+    assert.strictEqual(def.__test._pendingIdentityBySession.has(`opencode:${sid}`), false, "empty gate is cleared");
+
+    // Re-setup with a working lookup must hydrate the same session from scratch.
+    const cleanup2 = await def.setup({ app: {}, session: { get: async () => ({ parentID: "ses_parent" }) } });
+    t.after(cleanup2);
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_rehydrate" } });
+    await tick(40);
+
+    const posts = fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}`);
+    assert.strictEqual(posts.length, 1, "the event is not left permanently staged");
+    assert.strictEqual(posts[0].body.event, "PreToolUse");
+    assert.strictEqual(posts[0].body.headless, true, "rehydrated with the recovered child identity");
+  });
+
+  it("does not let a mid-replay terminal coalesce a staged event", async (t) => {
+    const calls = [];
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+    const original = globalThis.fetch;
+    globalThis.fetch = async (_url, options = {}) => {
+      calls.push(JSON.parse(options.body));
+      if (calls.length === 1) await firstGate;
+      return {
+        status: 200,
+        headers: { get: (name) => (name.toLowerCase() === "x-clawd-server" ? "clawd-on-desk" : null) },
+        text: async () => "",
+      };
+    };
+    t.after(() => { globalThis.fetch = original; });
+
+    const { def } = await makeDefinition();
+    let resolveIdentity;
+    const identityGate = new Promise((resolve) => { resolveIdentity = resolve; });
+    const cleanup = await def.setup({ app: {}, session: { get: () => identityGate } });
+    t.after(cleanup);
+    const sid = "ses_midflush";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_mid" } });
+    resolveIdentity({ parentID: "ses_root", title: "Child" });
+    // Wait until the hydration title POST is in flight: it is blocking the
+    // serial per-session FIFO while the staged PreToolUse waits to drain.
+    while (calls.length === 0) await tick(1);
+
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: sid } });
+    releaseFirst();
+    await tick(80);
+
+    const events = calls
+      .filter((b) => b.session_id === `opencode:${sid}`)
+      .map((b) => ({ event: b.event, headless: b.headless }));
+    assert.deepStrictEqual(events, [
+      { event: "SessionUpdate", headless: undefined },
+      { event: "PreToolUse", headless: true },
+      { event: "SessionEnd", headless: true },
+    ]);
+    assert.ok(!events.some((e) => e.event === "Stop"), "no root Stop");
+  });
+
+  it("orders a live session.created behind already-staged events", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_created_order";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_co" } });
+    // Live creation arrives with no parent: it supersedes the lookup and must
+    // be delivered after the already-staged tool event, not raced with it.
+    def.__test.handleV2Event({ type: "session.created", data: { sessionID: sid } });
+    await tick(30);
+
+    const events = fetchStub.calls
+      .filter((c) => c.body && c.body.session_id === `opencode:${sid}`)
+      .map((c) => c.body.event);
+    assert.deepStrictEqual(events, ["PreToolUse", "SessionStart"]);
+
+    gate.resolve({ parentID: "ses_parent" });
+    await tick(30);
+    assert.strictEqual(
+      def.__test._sessionParentById.has(`opencode:${sid}`),
+      false,
+      "a stale lookup must not set a parent after a live creation"
+    );
+    const after = fetchStub.calls
+      .filter((c) => c.body && c.body.session_id === `opencode:${sid}`)
+      .map((c) => c.body.event);
+    assert.deepStrictEqual(after, ["PreToolUse", "SessionStart"], "no late duplicate or loss");
+  });
+
+  it("stages a session.deleted turn end until a recovered child resolves", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+    const sid = "ses_deleted";
+
+    def.__test.handleV2Event({ type: "session.deleted", data: { sessionID: sid } });
+    await tick(20);
+    assert.strictEqual(
+      fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}`).length,
+      0,
+      "session.deleted is staged while identity is pending"
+    );
+
+    gate.resolve({ parentID: "ses_parent" });
+    await tick(40);
+    const ends = fetchStub.calls.filter(
+      (c) => c.body && c.body.session_id === `opencode:${sid}` && c.body.event === "SessionEnd"
+    );
+    assert.strictEqual(ends.length, 1, "exactly one SessionEnd");
+    assert.strictEqual(ends[0].body.headless, true);
+    assert.strictEqual(ends[0].body.state, "sleeping");
+  });
+
+  it("discards staged recovery events on dispose", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const gate = deferredLookup();
+    const { ctx } = v2Ctx({ session: { get: () => gate.promise } });
+    const cleanup = await def.setup(ctx);
+    const sid = "ses_dispose";
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: sid, id: "call_dispose" } });
+    await cleanup();
+    assert.strictEqual(def.__test._pendingIdentityBySession.size, 0, "staging is discarded on dispose");
+    gate.resolve({ parentID: "ses_parent" });
+    await tick(40);
+    assert.strictEqual(
+      fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}`).length,
+      0,
+      "a late lookup after dispose must not post"
+    );
   });
 });
 
