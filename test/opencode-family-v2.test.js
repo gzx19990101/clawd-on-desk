@@ -113,14 +113,22 @@ describe("opencode v2 event translation", () => {
     assert.deepStrictEqual(t("session.created", {}), { state: "idle", event: "SessionStart" });
     assert.deepStrictEqual(t("session.step.started", {}), { state: "thinking", event: "UserPromptSubmit" });
     assert.deepStrictEqual(t("session.reasoning.started", {}), { state: "thinking", event: "UserPromptSubmit" });
+    assert.deepStrictEqual(t("session.text.started", {}), { state: "thinking", event: "UserPromptSubmit" });
     assert.deepStrictEqual(t("session.status", { status: { type: "busy" } }), { state: "thinking", event: "UserPromptSubmit" });
     assert.deepStrictEqual(t("session.status", { status: { type: "idle" } }), { state: "attention", event: "Stop" });
-    assert.deepStrictEqual(t("session.tool.called", {}), { state: "working", event: "PreToolUse" });
-    assert.deepStrictEqual(t("session.tool.success", {}), { state: "working", event: "PostToolUse" });
-    assert.deepStrictEqual(t("session.tool.error", {}), { state: "error", event: "PostToolUseFailure" });
+    assert.deepStrictEqual(t("session.tool.called", {}), { state: "working", event: "PreToolUse", identity: null });
+    assert.deepStrictEqual(t("session.tool.called", { id: "call_a" }), {
+      state: "working", event: "PreToolUse", identity: "call_a\u0000running",
+    });
+    assert.deepStrictEqual(t("session.tool.success", {}), { state: "working", event: "PostToolUse", identity: null });
+    assert.deepStrictEqual(t("session.tool.error", {}), { state: "error", event: "PostToolUseFailure", identity: null });
+    assert.deepStrictEqual(t("session.tool.failed", { id: "call_b" }), {
+      state: "error", event: "PostToolUseFailure", identity: "call_b\u0000error",
+    });
     assert.deepStrictEqual(t("session.step.ended", { finish: "tool-calls" }), null);
     assert.deepStrictEqual(t("session.step.ended", { finish: "stop" }), { state: "attention", event: "Stop" });
     assert.deepStrictEqual(t("session.execution.succeeded", {}), { state: "attention", event: "Stop" });
+    assert.deepStrictEqual(t("session.execution.interrupted", { reason: "user" }), { state: "error", event: "StopFailure" });
     assert.deepStrictEqual(t("session.execution.failed", {}), { state: "error", event: "StopFailure" });
     assert.deepStrictEqual(t("session.error", {}), { state: "error", event: "StopFailure" });
     assert.deepStrictEqual(t("session.deleted", {}), { state: "sleeping", event: "SessionEnd" });
@@ -162,12 +170,14 @@ describe("opencode v2 event handler", () => {
     const states = fetchStub.calls
       .filter((c) => c.url.endsWith("/state"))
       .map((c) => `${c.body.event}→${c.body.state}@${c.body.cwd}`);
-    // PostToolUse dedups against PreToolUse (same working state), and
-    // execution.succeeded dedups against step.ended stop — same v1 semantics.
+    // Tool lifecycle events are recap's tool-call signal and never dedupe
+    // away (parallel tools repeat the working state); execution.succeeded
+    // still dedups against step.ended stop — same v1 semantics.
     assert.deepStrictEqual(states, [
       "SessionStart→idle@/tmp/proj",
       "UserPromptSubmit→thinking@/tmp/proj",
       "PreToolUse→working@/tmp/proj",
+      "PostToolUse→working@/tmp/proj",
       "Stop→attention@/tmp/proj",
     ]);
     for (const call of fetchStub.calls.filter((c) => c.url.endsWith("/state"))) {
@@ -187,8 +197,12 @@ describe("opencode v2 event handler", () => {
 
     def.__test.handleV2Event({ type: "session.renamed", data: { sessionID: sid, title: "Fix the flux" } });
     def.__test.handleV2Event({
-      type: "session.usage.updated",
-      data: { sessionID: sid, tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 100, write: 3 } } },
+      type: "session.step.ended",
+      data: {
+        sessionID: sid,
+        finish: "tool-calls",
+        tokens: { input: 10, output: 5, reasoning: 2, cache: { read: 100, write: 3 } },
+      },
     });
     await tick();
 
@@ -197,7 +211,7 @@ describe("opencode v2 event handler", () => {
     assert.strictEqual(metas.length, 2);
     assert.strictEqual(metas[0].body.session_title, "Fix the flux");
     assert.strictEqual(metas[0].body.event, "SessionUpdate");
-    assert.strictEqual(metas[1].body.context_usage, 120);
+    assert.deepStrictEqual(metas[1].body.context_usage, { used: 120, limit: null, source: "opencode" });
   });
 
   it("omits cwd when the envelope has no location (fail-closed)", async (t) => {
@@ -330,5 +344,351 @@ describe("opencode v2 entry drift locks", () => {
     // node_modules) and must not add named exports.
     assert.ok(!/from ["']@opencode\//.test(source));
     assert.ok(!/export\s+(const|let|var|function|class|\{)/.test(source));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review follow-ups (PR #1053): turn-start reporting, step-token context
+// usage, recovered child identity, bounded hydration, interruption
+// semantics, subscription failures, single V2 activation, per-copy gates.
+// ---------------------------------------------------------------------------
+
+// Minimal v2 ctx: a controllable event queue plus the optional model/session
+// APIs the runtime consults for limits and identity hydration.
+function v2Ctx(overrides = {}) {
+  const queue = [];
+  let notify = null;
+  return {
+    push(envelope) {
+      queue.push(envelope);
+      if (notify) {
+        const wake = notify;
+        notify = null;
+        wake();
+      }
+    },
+    ctx: {
+      app: { name: "opencode", version: "2.0.15" },
+      event: {
+        subscribe() {
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                async next() {
+                  while (queue.length === 0) {
+                    await new Promise((resolve) => { notify = resolve; });
+                  }
+                  return { value: queue.shift(), done: false };
+                },
+              };
+            },
+          };
+        },
+      },
+      model: { list: async () => ({ data: [] }) },
+      session: { get: async () => ({}) },
+      ...overrides,
+    },
+  };
+}
+
+describe("opencode v2 review follow-ups", () => {
+  it("reports thinking and a Stop for each consecutive text-only turn", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const sid = "ses_textturns";
+    const turn = () => [
+      { type: "session.step.started", data: { sessionID: sid } },
+      { type: "session.reasoning.started", data: { sessionID: sid } },
+      { type: "session.text.started", data: { sessionID: sid } },
+      { type: "session.step.ended", data: { sessionID: sid, finish: "stop" } },
+      { type: "session.execution.succeeded", data: { sessionID: sid } },
+    ];
+    for (const envelope of turn()) def.__test.handleV2Event(envelope);
+    await tick(60);
+    for (const envelope of turn()) def.__test.handleV2Event(envelope);
+    await tick(60);
+
+    const posts = fetchStub.calls.filter((c) => c.body && c.body.session_id === `opencode:${sid}`);
+    assert.strictEqual(
+      posts.filter((c) => c.body.event === "Stop").length,
+      2,
+      "each text-only turn ends with its own Stop"
+    );
+    assert.ok(
+      posts.filter((c) => c.body.event === "UserPromptSubmit").length >= 2,
+      "each text-only turn reports thinking"
+    );
+  });
+
+  it("reports step tokens with the model limit resolved from the registry", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({
+      model: { list: async () => ({ data: [{ id: "gpt", providerID: "prov", limit: { context: 100000 } }] }) },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    const sid = "ses_usage";
+    def.__test.handleV2Event({ type: "session.created", data: { sessionID: sid } });
+    def.__test.handleV2Event({
+      type: "session.step.started",
+      data: { sessionID: sid, model: { id: "gpt", providerID: "prov" } },
+    });
+    def.__test.handleV2Event({
+      type: "session.step.ended",
+      data: { sessionID: sid, finish: "stop", tokens: { input: 5, output: 4, reasoning: 3, cache: { read: 2, write: 1 } } },
+    });
+    await tick(80);
+
+    const usages = fetchStub.calls.filter((c) => c.body && c.body.context_usage && c.body.session_id === `opencode:${sid}`);
+    assert.ok(usages.length >= 1, "context usage POST");
+    assert.deepStrictEqual(usages[usages.length - 1].body.context_usage, {
+      used: 15,
+      limit: 100000,
+      source: "opencode",
+    });
+  });
+
+  it("uses the created default model and re-pushes a first-observed sample", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({
+      model: { list: async () => ({ data: [{ id: "gpt", providerID: "prov", limit: { context: 100000 } }] }) },
+      session: {
+        get: async (input) => (input.sessionID === "ses_firstseen"
+          ? { model: { id: "gpt", providerID: "prov" } }
+          : {}),
+      },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    // Default model: created.model present, no step.started.
+    def.__test.handleV2Event({
+      type: "session.created",
+      data: { sessionID: "ses_default", model: { id: "gpt", providerID: "prov" } },
+    });
+    def.__test.handleV2Event({
+      type: "session.step.ended",
+      data: { sessionID: "ses_default", finish: "stop", tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } },
+    });
+
+    // First-observed sample: only a step end exists; the identity hydration
+    // supplies the model and the sample is re-pushed with the limit.
+    def.__test.handleV2Event({
+      type: "session.step.ended",
+      data: { sessionID: "ses_firstseen", finish: "stop", tokens: { input: 7, output: 3, reasoning: 0, cache: { read: 0, write: 0 } } },
+    });
+    await tick(100);
+
+    for (const sid of ["ses_default", "ses_firstseen"]) {
+      const usages = fetchStub.calls.filter((c) => c.body && c.body.context_usage && c.body.session_id === `opencode:${sid}`);
+      assert.ok(usages.length >= 1, `context usage POST for ${sid}`);
+      assert.strictEqual(usages[usages.length - 1].body.context_usage.limit, 100000, `${sid} resolves its limit`);
+    }
+  });
+
+  it("restores parent identity for a recovered child session without a lifecycle", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({
+      session: {
+        get: async () => ({ parentID: "ses_parent", title: "Child", location: { directory: "C:/proj" } }),
+      },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_child", id: "call_c1" } });
+    await tick(40);
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_child", id: "call_c2" } });
+    def.__test.handleV2Event({ type: "session.execution.succeeded", data: { sessionID: "ses_child" } });
+    await tick(60);
+
+    const posts = fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_child");
+    assert.ok(
+      posts.some((c) => c.body.event === "PreToolUse" && c.body.headless === true),
+      "recovered child reports headless"
+    );
+    assert.ok(posts.some((c) => c.body.event === "SessionEnd"), "child completion is a SessionEnd");
+    assert.ok(!posts.some((c) => c.body.event === "Stop"), "child completion is never a root Stop");
+    assert.ok(!posts.some((c) => c.body.event === "SessionStart"), "hydration invents no lifecycle");
+    assert.ok(posts.some((c) => c.body.session_title === "Child"), "hydrated title reaches metadata");
+  });
+
+  it("keeps other sessions flowing while one identity lookup hangs", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({
+      session: {
+        get: (input) => (input.sessionID === "ses_hung"
+          ? new Promise(() => {})
+          : Promise.resolve({})),
+      },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_hung", id: "call_h1" } });
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_fast", id: "call_f1" } });
+    await tick(60);
+
+    const fast = fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_fast");
+    assert.ok(fast.length > 0, "an unrelated session must not wait behind a hung lookup");
+  });
+
+  it("never retries a failed identity lookup", async (t) => {
+    let calls = 0;
+    const { def } = await makeDefinition();
+    const { ctx } = v2Ctx({
+      session: {
+        get: async () => {
+          calls += 1;
+          throw new Error("lookup failed");
+        },
+      },
+    });
+    const cleanup = await def.setup(ctx);
+    t.after(cleanup);
+
+    for (let i = 0; i < 3; i += 1) {
+      def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_fail", id: `call_f${i}` } });
+    }
+    await tick(60);
+    assert.strictEqual(calls, 1, "a failed lookup is attempted once");
+  });
+
+  it("an interruption clears state without counting a completed turn", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_int", id: "call_int" } });
+    def.__test.handleV2Event({
+      type: "session.execution.interrupted",
+      data: { sessionID: "ses_int", reason: "user" },
+    });
+    await tick(60);
+
+    const posts = fetchStub.calls.filter((c) => c.body && c.body.session_id === "opencode:ses_int");
+    const last = posts[posts.length - 1];
+    assert.deepStrictEqual(
+      { state: last.body.state, event: last.body.event },
+      { state: "error", event: "StopFailure" }
+    );
+
+    const { mapRecapMetrics } = require("../src/recap-metrics");
+    assert.deepStrictEqual(
+      mapRecapMetrics({ agentId: "opencode", event: last.body.event, completionAccepted: true }),
+      ["activity"],
+      "a cancelled turn must not increment completed turns"
+    );
+  });
+
+  it("delivers each tool lifecycle identity exactly once", async (t) => {
+    const fetchStub = stubFetch(t);
+    const { def } = await makeDefinition();
+    const duplicate = { type: "session.tool.called", data: { sessionID: "ses_tool", id: "call_dup", input: {} } };
+    def.__test.handleV2Event(duplicate);
+    def.__test.handleV2Event(duplicate);
+    def.__test.handleV2Event({ type: "session.tool.called", data: { sessionID: "ses_tool", id: "call_dup2", input: {} } });
+    await tick(60);
+
+    const pres = fetchStub.calls.filter((c) => c.body && c.body.event === "PreToolUse" && c.body.session_id === "opencode:ses_tool");
+    assert.strictEqual(pres.length, 2, "one PreToolUse per call identity");
+  });
+
+  it("classifies subscription aborts and surfaces unexpected stream failures", async (t) => {
+    const rejections = [];
+    const onRejection = (reason) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    t.after(() => process.removeListener("unhandledRejection", onRejection));
+
+    const { def } = await makeDefinition();
+    const cleanupBroken = await def.setup({
+      app: {},
+      event: {
+        subscribe() {
+          return {
+            [Symbol.asyncIterator]() {
+              return { next: async () => { throw new Error("stream broke"); } };
+            },
+          };
+        },
+      },
+    });
+    t.after(cleanupBroken);
+    await tick(40);
+    await def.__test.flushDebugLog();
+    assert.match(
+      fs.readFileSync(def.__test._debugLogPath, "utf8"),
+      /EVENT stream error: stream broke/
+    );
+
+    // A dispose abort is intentional and must be logged as such. The next
+    // setup resets the shared debug log, so read the first case before.
+    const { def: def2 } = await makeDefinition();
+    const cleanup = await def2.setup({
+      app: {},
+      event: {
+        subscribe({ signal }) {
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                next: () => new Promise((_, reject) => {
+                  signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+                }),
+              };
+            },
+          };
+        },
+      },
+    });
+    await cleanup();
+    await tick(40);
+    await def2.__test.flushDebugLog();
+    assert.match(
+      fs.readFileSync(def2.__test._debugLogPath, "utf8"),
+      /EVENT stream aborted by dispose/
+    );
+    assert.deepStrictEqual(rejections, [], "stream failures must not become unhandled rejections");
+  });
+});
+
+describe("opencode v2 activation and ownership gates", () => {
+  it("keeps exactly one V2-valid implementation across the dual entries", async () => {
+    const v1 = await import(pathToFileURL(path.join(HOOKS_DIR, "opencode-plugin", "index.mjs")).href);
+    const v2 = await import(pathToFileURL(path.join(HOOKS_DIR, "opencode-plugin-v2", "index.mjs")).href);
+    assert.strictEqual(typeof v1.default, "function", "the v1 entry stays a function (the v2 loader rejects it)");
+    assert.strictEqual(typeof v2.default, "object");
+    assert.strictEqual(v2.default.id, "clawd-on-desk-opencode");
+  });
+
+  it("keeps an orphan managed copy inert even when a live copy is active", async (t) => {
+    const fetchStub = stubFetch(t);
+    const live = await makeDefinition();
+    const liveCtx = v2Ctx();
+    const liveCleanup = await live.def.setup(liveCtx.ctx);
+    t.after(liveCleanup);
+
+    const genDir = path.join(TEMP_HOME, "homes", "cfg", "generations", "a".repeat(64), "opencode-family-plugin");
+    fs.mkdirSync(genDir, { recursive: true });
+    for (const name of ["core.mjs", "session-ids.mjs"]) {
+      fs.copyFileSync(path.join(HOOKS_DIR, "opencode-family-plugin", name), path.join(genDir, name));
+    }
+    const orphanCore = await import(pathToFileURL(path.join(genDir, "core.mjs")).href);
+    const orphan = orphanCore.createOpencodeFamilyPluginV2(V2_PARAMS);
+    const orphanCtx = v2Ctx();
+    const orphanCleanup = await orphan.setup(orphanCtx.ctx);
+    t.after(orphanCleanup);
+
+    const envelope = { type: "session.created", data: { sessionID: "ses_copy" } };
+    liveCtx.push(envelope);
+    orphanCtx.push(envelope);
+    await tick(80);
+
+    assert.strictEqual(orphan.__test._lastStatePerSession.size, 0, "orphan copy stays inert");
+    const starts = fetchStub.calls.filter((c) => c.body && c.body.event === "SessionStart");
+    assert.strictEqual(starts.length, 1, "only the live copy reports");
   });
 });

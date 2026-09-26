@@ -2687,8 +2687,11 @@ export function createOpencodeFamilyPlugin(config) {
 //     is intentionally omitted — fail-closed omission instead of wrong values.
 //     Terminal focus degrades for v2 sessions (known limitation).
 //   - Per-event cwd comes from the event envelope `location.directory`; titles
-//     arrive via `session.renamed`; `session.usage.updated` carries session
-//     tokens directly (no SDK provider lookup needed for context usage).
+//     arrive via `session.renamed`; context usage comes from each
+//     `session.step.ended` (the step's own tokens = context occupancy), with
+//     the model limit resolved from the ctx.model registry in the background.
+//     `session.usage.updated` is the session's cumulative billing total and
+//     must never feed context usage.
 //   - "Always allow" has no host persistence API (permission domain exposes
 //     only get/hook/list/reply), so an `always` decision records an in-memory
 //     per-session action rule inside the service. It covers the session's
@@ -2757,6 +2760,24 @@ export function createOpencodeFamilyPluginV2(config) {
   let _reqCounter = 0;
   let _permissionReqCounter = 0;
 
+  // Child-session classification (parent map) and per-session model, both
+  // seeded from session.created / session.step.started and — for sessions
+  // that predate this plugin load — from a bounded identity hydration.
+  const _sessionParentById = new Map();
+  const _sessionModelById = new Map();
+  // Tool lifecycle identity dedup: recap counts tool calls from these POSTs,
+  // parallel tools repeat the same working state, and every module copy
+  // observes the same events — each (call, phase) is delivered exactly once.
+  const _toolEventSeen = new Set();
+  const TOOL_EVENT_SEEN_LIMIT = 512;
+  // Model -> context limit lookups (ctx.model registry), cached per model.
+  const _modelLimitCache = new Map();
+  // Identity hydration is best-effort, bounded, and never retried after a
+  // failure so one unreachable session cannot stall or hammer the service.
+  const _hydrationState = new Map();
+  const HYDRATION_TIMEOUT_MS = 3000;
+  let _ctx = null;
+
   const _debugBuffer = [];
   let _debugFlushing = false;
   function debugLog(msg) {
@@ -2816,6 +2837,13 @@ export function createOpencodeFamilyPluginV2(config) {
     return port ? [port] : [];
   }
 
+  // Stable per-(call, phase) identity for tool lifecycle dedup. Null when the
+  // host event carries no call id — such events fall back to permissive
+  // sending rather than risking a dropped tool report.
+  function toolEventIdentity(data, phase) {
+    return data && typeof data.id === "string" && data.id ? `${data.id}\0${phase}` : null;
+  }
+
   // Translate a v2 event (type + data) into a Clawd (state, eventName) pair,
   // or null when Clawd should ignore it. Pure so tests can lock the mapping
   // against the evidence table in docs/investigations/opencode-v2-e1-evidence.md.
@@ -2837,16 +2865,20 @@ export function createOpencodeFamilyPluginV2(config) {
 
       case "session.step.started":
       case "session.reasoning.started":
+      case "session.text.started":
         return { state: "thinking", event: "UserPromptSubmit" };
 
       case "session.tool.called":
-        return { state: "working", event: "PreToolUse" };
+        return { state: "working", event: "PreToolUse", identity: toolEventIdentity(data, "running") };
 
       case "session.tool.success":
-        return { state: "working", event: "PostToolUse" };
+        return { state: "working", event: "PostToolUse", identity: toolEventIdentity(data, "completed") };
 
+      // v2.0.15's contract names this `session.tool.failed`; accept the older
+      // `session.tool.error` spelling too so either host shape maps.
+      case "session.tool.failed":
       case "session.tool.error":
-        return { state: "error", event: "PostToolUseFailure" };
+        return { state: "error", event: "PostToolUseFailure", identity: toolEventIdentity(data, "error") };
 
       case "session.step.ended":
         // Per-step teardown only ends the turn when the model stopped on its
@@ -2857,6 +2889,13 @@ export function createOpencodeFamilyPluginV2(config) {
 
       case "session.execution.succeeded":
         return { state: "attention", event: "Stop" };
+
+      // Interruption ends the turn WITHOUT completing it: StopFailure is the
+      // vocabulary's cancellation terminal (deriveSessionBadge maps it to the
+      // "interrupted" badge and it is not a done event), so a cancelled turn
+      // never increments completed turns while active state still clears.
+      case "session.execution.interrupted":
+        return { state: "error", event: "StopFailure" };
 
       case "session.execution.failed":
       case "session.error":
@@ -2961,7 +3000,9 @@ export function createOpencodeFamilyPluginV2(config) {
     const terminal = !!body && body.event === "SessionEnd";
     const metadata = isV2MetadataSnapshot({ body });
     const replaceable = !terminal && !metadata && !!body
-      && ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"].includes(body.event);
+      // Tool lifecycle events are recap's tool-call signal (and parallel
+      // tools repeat the same working state), so they never coalesce.
+      && ["UserPromptSubmit", "PreCompact"].includes(body.event);
     const snapshot = makeV2Snapshot(body, `STATE ${body.event}→${body.state}${metadata ? " meta" : ""}`);
     let queue = _statePostQueueBySession.get(sessionId);
     if (!queue) {
@@ -2991,7 +3032,7 @@ export function createOpencodeFamilyPluginV2(config) {
         debugLog(`POST[${snapshot.reqId}] ${snapshot.logTag} coalesced=metadata-fields`);
         return snapshot.completion;
       }
-      if (replaceable && last && ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact"]
+      if (replaceable && last && ["UserPromptSubmit", "PreCompact"]
         .includes(last.body && last.body.event) && !(last.body && last.body.metadata_only === true)) {
         settleV2Snapshot(last);
         queue.pending[queue.pending.length - 1] = snapshot;
@@ -3013,7 +3054,9 @@ export function createOpencodeFamilyPluginV2(config) {
     return snapshot.completion;
   }
 
-  function sendStateV2(state, eventName, sessionId, cwd) {
+  const V2_TOOL_LIFECYCLE_EVENTS = new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]);
+
+  function sendStateV2(state, eventName, sessionId, cwd, identity = null) {
     if (!state || !eventName) return;
     const clawdSessionId = normalizeSessionId(sessionId) || DEFAULT_SESSION_ID;
     const body = {
@@ -3026,8 +3069,27 @@ export function createOpencodeFamilyPluginV2(config) {
     const title = _sessionTitleById.get(clawdSessionId);
     if (title) body.session_title = title;
     if (cwd) body.cwd = cwd;
+    // v1 parity: child sessions stay out of the HUD and their completion is a
+    // SessionEnd, not a root Stop.
+    if (_sessionParentById.has(clawdSessionId)) body.headless = true;
+
     const lastState = _lastStatePerSession.get(clawdSessionId) || null;
-    if (body.state === lastState) return;
+    if (V2_TOOL_LIFECYCLE_EVENTS.has(eventName)) {
+      // Tool lifecycle events bypass the same-state dedup (parallel tools
+      // repeat "working") but deliver once per (call, phase) identity — the
+      // recap tool-call counter reads these POSTs.
+      if (identity) {
+        const key = `${clawdSessionId}\0${identity}`;
+        if (_toolEventSeen.has(key)) return;
+        _toolEventSeen.add(key);
+        if (_toolEventSeen.size > TOOL_EVENT_SEEN_LIMIT) {
+          const oldest = _toolEventSeen.values().next().value;
+          if (oldest) _toolEventSeen.delete(oldest);
+        }
+      }
+    } else if (body.state === lastState) {
+      return;
+    }
     debugLog(`SEND ${lastState || "null"} → ${body.state} event=${body.event} session=${clawdSessionId}`);
     _lastStatePerSession.set(clawdSessionId, body.state);
     postStateToClawdV2(body);
@@ -3077,17 +3139,42 @@ export function createOpencodeFamilyPluginV2(config) {
       : null;
     if (sessionId && envelopeCwd) _sessionCwdById.set(sessionId, envelopeCwd);
 
+    // Session identity side captures — no lifecycle is invented for them.
+    if (type === "session.created" && sessionId) {
+      const parentID = typeof data.parentID === "string" && data.parentID.trim()
+        ? normalizeSessionId(data.parentID)
+        : null;
+      if (parentID) _sessionParentById.set(sessionId, parentID);
+      if (data.model && typeof data.model === "object") {
+        _sessionModelById.set(sessionId, {
+          providerID: typeof data.model.providerID === "string" ? data.model.providerID : null,
+          modelID: typeof data.model.id === "string" ? data.model.id : null,
+        });
+      }
+      // A live creation carries the session identity; only sessions that
+      // predate this load need the ctx.session.get hydration below.
+      _hydrationState.set(sessionId, "known");
+    }
+
+    if (type === "session.step.started" && sessionId && data.model && typeof data.model === "object") {
+      _sessionModelById.set(sessionId, {
+        providerID: typeof data.model.providerID === "string" ? data.model.providerID : null,
+        modelID: typeof data.model.id === "string" ? data.model.id : null,
+      });
+    }
+
+    if (type === "session.step.ended" && sessionId) {
+      // Context usage is the step's own token accounting (context occupancy).
+      // session.usage.updated carries the session's cumulative billing totals
+      // and must never feed it (it pins any percentage at 100%).
+      reportV2ContextUsage(sessionId, data);
+    }
+
+    if (sessionId) ensureV2SessionHydration(rawSessionId);
+
     if (type === "session.renamed") {
       const titled = captureV2Title(sessionId, data.title);
       if (titled) sendMetadataV2(titled, { session_title: data.title });
-      return;
-    }
-
-    if (type === "session.usage.updated") {
-      const used = extractContextUsageUsed(data.tokens);
-      if (used != null && sessionId) {
-        sendMetadataV2(sessionId, { context_usage: used });
-      }
       return;
     }
 
@@ -3119,7 +3206,118 @@ export function createOpencodeFamilyPluginV2(config) {
       return;
     }
     const cwd = envelopeCwd || _sessionCwdById.get(sessionId) || null;
-    sendStateV2(mapped.state, mapped.event, sessionId, cwd);
+    // v1 parity: a child session's turn end is a SessionEnd, never a root
+    // Stop, and its reports stay headless (sendStateV2 reads the parent map).
+    const child = _sessionParentById.has(sessionId);
+    if (child && mapped.event === "Stop") {
+      sendStateV2("sleeping", "SessionEnd", sessionId, cwd);
+      return;
+    }
+    sendStateV2(mapped.state, mapped.event, sessionId, cwd, mapped.identity);
+  }
+
+  // Context usage is the step's own token accounting (context occupancy).
+  // The model limit resolves from the ctx.model registry in the background:
+  // the sample ships immediately with what is known and is re-pushed once the
+  // limit lands, so nothing blocks the shared event consumption path and a
+  // first-observed sample does not keep a missing limit forever.
+  const _lastUsedBySession = new Map();
+
+  async function resolveV2ModelLimit(model) {
+    if (!model || !model.modelID) return null;
+    const key = `${model.providerID || ""}\u0000${model.modelID}`;
+    if (_modelLimitCache.has(key)) return _modelLimitCache.get(key);
+    let limit = null;
+    try {
+      const registry = _ctx && _ctx.model && typeof _ctx.model.list === "function" ? await _ctx.model.list() : null;
+      const models = Array.isArray(registry) ? registry : (registry && registry.data) || [];
+      const match = models.find((entry) => entry
+        && (entry.id === model.modelID || entry.modelID === model.modelID)
+        && (!model.providerID || entry.providerID === model.providerID));
+      if (match && match.limit && Number.isFinite(match.limit.context) && match.limit.context > 0) {
+        limit = match.limit.context;
+      }
+    } catch (err) {
+      debugLog(`CTX limit lookup failed: ${err && err.message}`);
+    }
+    // Misses are not cached: a later registry reload may resolve the model.
+    if (limit == null) return null;
+    _modelLimitCache.set(key, limit);
+    return limit;
+  }
+
+  function pushV2ContextUsage(sessionId) {
+    const used = _lastUsedBySession.get(sessionId);
+    if (used == null) return;
+    const model = _sessionModelById.get(sessionId) || null;
+    const cachedLimit = model ? _modelLimitCache.get(`${model.providerID || ""}\u0000${model.modelID}`) : null;
+    sendMetadataV2(sessionId, {
+      context_usage: { used, limit: cachedLimit == null ? null : cachedLimit, source: "opencode" },
+    });
+    if (model && cachedLimit == null) {
+      void resolveV2ModelLimit(model).then((limit) => {
+        if (limit != null) pushV2ContextUsage(sessionId);
+      });
+    }
+  }
+
+  function reportV2ContextUsage(sessionId, data) {
+    const used = extractContextUsageUsed(data && data.tokens);
+    if (used == null) return;
+    _lastUsedBySession.set(sessionId, used);
+    pushV2ContextUsage(sessionId);
+  }
+
+  // First-seen sessions (for example after a service restart) carry their
+  // identity in ctx.session.get, not in any event. Hydrate once per session
+  // in the background: bounded, off the shared consumption path, never
+  // retried after a failure, and it only fills maps — no lifecycle event is
+  // invented for the recovered session.
+  function ensureV2SessionHydration(rawSessionId) {
+    const sessionId = normalizeSessionId(rawSessionId);
+    if (!sessionId || _hydrationState.has(sessionId)) return;
+    const sessionApi = _ctx && _ctx.session && typeof _ctx.session.get === "function" ? _ctx.session : null;
+    if (!sessionApi) {
+      _hydrationState.set(sessionId, "failed");
+      return;
+    }
+    _hydrationState.set(sessionId, "pending");
+    void (async () => {
+      let info;
+      try {
+        const timeout = new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(new Error("hydration timeout")), HYDRATION_TIMEOUT_MS);
+          if (timer && typeof timer.unref === "function") timer.unref();
+        });
+        // The host API speaks raw session ids; only internal maps use the
+        // namespaced form.
+        info = await Promise.race([sessionApi.get({ sessionID: rawSessionId }), timeout]);
+      } catch (err) {
+        _hydrationState.set(sessionId, "failed");
+        debugLog(`HYDRATE session=${sessionId} failed: ${err && err.message}`);
+        return;
+      }
+      _hydrationState.set(sessionId, "done");
+      if (!info || typeof info !== "object") return;
+      const parentID = typeof info.parentID === "string" && info.parentID.trim()
+        ? normalizeSessionId(info.parentID)
+        : null;
+      if (parentID) _sessionParentById.set(sessionId, parentID);
+      if (info.model && typeof info.model === "object" && !_sessionModelById.has(sessionId)) {
+        _sessionModelById.set(sessionId, {
+          providerID: typeof info.model.providerID === "string" ? info.model.providerID : null,
+          modelID: typeof info.model.id === "string" ? info.model.id : null,
+        });
+      }
+      const directory = info.location && typeof info.location.directory === "string"
+        && info.location.directory.trim()
+        ? info.location.directory
+        : null;
+      if (directory) _sessionCwdById.set(sessionId, directory);
+      const titled = captureV2Title(sessionId, info.title);
+      if (titled) sendMetadataV2(titled, { session_title: info.title });
+      if (_lastUsedBySession.has(sessionId)) pushV2ContextUsage(sessionId);
+    })();
   }
 
   function rememberAlwaysAllow(sessionId, action) {
@@ -3281,6 +3479,7 @@ export function createOpencodeFamilyPluginV2(config) {
         return () => {};
       }
       resetDebugLog();
+      _ctx = ctx;
       const app = ctx && ctx.app && typeof ctx.app === "object" ? ctx.app : {};
       debugLog(`INIT v2 pid=${process.pid} app=${app.name || "?"}@${app.version || "?"} gate=${managedGate.mode}`);
 
@@ -3321,7 +3520,15 @@ export function createOpencodeFamilyPluginV2(config) {
           }
           debugLog("EVENT stream ended");
         })().catch((err) => {
-          debugLog(`EVENT stream error: ${err && err.message}`);
+          // Intentional disposal aborts the iterator; anything else is an
+          // unexpected subscription failure and must stay visible.
+          const aborted = controller.signal.aborted
+            || (err && (err.name === "AbortError" || err.code === "ABORT_ERR"));
+          if (aborted) {
+            debugLog("EVENT stream aborted by dispose");
+          } else {
+            debugLog(`EVENT stream error: ${err && err.message}`);
+          }
         });
         debugLog("EVENT subscription started");
       } else {
@@ -3358,6 +3565,10 @@ export function createOpencodeFamilyPluginV2(config) {
     postStateToClawdV2,
     sendStateV2,
     sendMetadataV2,
+    reportV2ContextUsage,
+    pushV2ContextUsage,
+    ensureV2SessionHydration,
+    resolveV2ModelLimit,
     rememberAlwaysAllow,
     captureV2Title,
     getPortCandidates,
@@ -3371,6 +3582,11 @@ export function createOpencodeFamilyPluginV2(config) {
     get _lastStatePerSession() { return _lastStatePerSession; },
     get _sessionTitleById() { return _sessionTitleById; },
     get _sessionCwdById() { return _sessionCwdById; },
+    get _sessionParentById() { return _sessionParentById; },
+    get _sessionModelById() { return _sessionModelById; },
+    get _lastUsedBySession() { return _lastUsedBySession; },
+    get _toolEventSeen() { return _toolEventSeen; },
+    get _hydrationState() { return _hydrationState; },
     get _alwaysAllowedBySessionAction() { return _alwaysAllowedBySessionAction; },
     get _statePostQueueBySession() { return _statePostQueueBySession; },
   };

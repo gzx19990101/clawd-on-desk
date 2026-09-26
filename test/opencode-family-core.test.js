@@ -403,18 +403,7 @@ describe("opencode-family registry", () => {
       // #413: the entry module must have exactly one export — default.
       const mod = await import(pathToFileURL(entryPath).href);
       assert.deepStrictEqual(Object.keys(mod), ["default"]);
-      // The default's KIND is per-member: the registry pins each host
-      // loader's contract in pluginEntry (OpenCode V2 wants the definition
-      // object, MiMo's legacy loader wants the function).
-      if (cfg.pluginEntry === "v2-definition") {
-        assert.strictEqual(typeof mod.default, "object");
-        assert.strictEqual(typeof mod.default.id, "string");
-        assert.strictEqual(typeof mod.default.setup, "function");
-        assert.strictEqual(typeof mod.default.server, "function");
-      } else {
-        assert.strictEqual(cfg.pluginEntry, "legacy-function", `${agentId} has an unknown pluginEntry contract`);
-        assert.strictEqual(typeof mod.default, "function");
-      }
+      assert.strictEqual(typeof mod.default, "function");
     }
   });
 

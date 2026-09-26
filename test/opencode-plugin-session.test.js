@@ -191,24 +191,16 @@ describe("opencode plugin session ids", () => {
 });
 
 describe("opencode plugin module shape (#413 regression guard)", () => {
-  it("exposes exactly one export: the default V2 definition", async () => {
+  it("exposes exactly one export: the default plugin function", async () => {
     const mod = await loadPluginModule();
-    // Any extra named export (a test helper, a constant, anything) silently
-    // kills the whole plugin — that was #413. Test internals must ride on the
-    // default export (mod.default.__test), never as a separate module export.
-    //
-    // The default must be a plain OBJECT: OpenCode V2 requires a
-    // { id, setup } definition and rejects function defaults ("Expected object
-    // at default"), while OpenCode V1 >= 1.18.29 consumes the same object
-    // through its server() function. Older V1 loaders that iterate the module
-    // namespace and require functions can no longer load this entry.
+    // opencode's getLegacyPlugins() iterates Object.values(mod) and throws
+    // "Plugin export is not a function" on any non-function export. Any extra
+    // named export (a test helper, a constant, anything) silently kills the
+    // whole plugin — that was #413. Test internals must ride on the default
+    // function (mod.default.__test), never as a separate module export.
     assert.deepStrictEqual(Object.keys(mod), ["default"]);
-    assert.strictEqual(typeof mod.default, "object");
-    assert.strictEqual(typeof mod.default.id, "string");
-    assert.strictEqual(typeof mod.default.setup, "function");
-    assert.strictEqual(typeof mod.default.server, "function");
-    assert.strictEqual(typeof mod.default.__test, "object");
-    assert.strictEqual(typeof mod.default.__test.translateEvent, "function");
+    assert.strictEqual(typeof mod.default, "function");
+    assert.deepStrictEqual(Object.values(mod).map((v) => typeof v), ["function"]);
   });
 });
 
