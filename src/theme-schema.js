@@ -226,6 +226,14 @@ function validateTheme(cfg) {
     errors.push(`roamFlipAssets must be a boolean, got ${JSON.stringify(cfg.roamFlipAssets)}`);
   }
 
+  if (Array.isArray(cfg.idleAnimations)) {
+    cfg.idleAnimations.forEach((entry, index) => {
+      if (entry && entry.mirrorOnRightSide !== undefined && typeof entry.mirrorOnRightSide !== "boolean") {
+        errors.push(`idleAnimations[${index}].mirrorOnRightSide must be a boolean, got ${JSON.stringify(entry.mirrorOnRightSide)}`);
+      }
+    });
+  }
+
   if (cfg.mirroredFiles !== undefined) {
     errors.push(...validateMirroredFiles(cfg.mirroredFiles));
   }

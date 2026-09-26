@@ -117,6 +117,22 @@ describe("theme schema validation", () => {
     }
   });
 
+  it("rejects a non-boolean idleAnimations[].mirrorOnRightSide", () => {
+    const withFlag = (mirrorOnRightSide) => validThemeJson({
+      idleAnimations: [{ file: "idle.svg", duration: 5000, mirrorOnRightSide }],
+    });
+    assert.deepStrictEqual(schema.validateTheme(withFlag(true)), []);
+    assert.deepStrictEqual(schema.validateTheme(withFlag(false)), []);
+
+    for (const bad of ["true", 1, {}]) {
+      const errors = schema.validateTheme(withFlag(bad));
+      assert.ok(
+        errors.some((error) => error.includes("idleAnimations[0].mirrorOnRightSide must be a boolean")),
+        `expected a mirrorOnRightSide error for ${JSON.stringify(bad)}`
+      );
+    }
+  });
+
   it("validates mirroredFiles as a map to distinct file names", () => {
     const withMap = (mirroredFiles) => validThemeJson({ mirroredFiles });
     assert.deepStrictEqual(schema.validateTheme(withMap({ "mini-happy.apng": "mini-happy-left.apng" })), []);

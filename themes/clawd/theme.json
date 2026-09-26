@@ -1170,7 +1170,8 @@
     },
     {
       "file": "clawd-idle-bubble.svg",
-      "duration": 13500
+      "duration": 13500,
+      "mirrorOnRightSide": true
     },
     {
       "file": "clawd-idle-reading.svg",

@@ -18,7 +18,7 @@ const {
   buildShadowComparison,
   processMetadataForState,
 } = require("./server-windows-process-metadata");
-const { stripRemoteProcessMetadata } = require("./remote-process-metadata");
+const { isWslSourced, stripRemoteProcessMetadata } = require("./remote-process-metadata");
 const {
   normalizeHookToolUseId,
   findPendingPermissionForStateEvent,
@@ -250,10 +250,14 @@ function handleStatePost(req, res, options) {
       const rawWtHwnd = normalizeHwndString(data.wt_hwnd ?? data.wtHwnd);
       const cwd = typeof data.cwd === "string" ? data.cwd : "";
       const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
+      // A WSL hook reports Linux PIDs that alias unrelated processes on this
+      // Windows host, so they are stripped exactly like Remote SSH metadata.
+      // `orcaPaneKey`, `cwd` and `host` are untouched by design — see
+      // remote-process-metadata.js.
+      const wslSourced = isWslSourced({ wslDistro: data.wsl_distro, host: data.host });
       // Stripped at the parse boundary rather than at the updateSession call so
       // that no downstream consumer (legacy metadata, the Windows chain gate,
-      // the codex user-input bubble) has to remember the rule. `orcaPaneKey`,
-      // `cwd` and `host` are untouched by design — see remote-process-metadata.js.
+      // the codex user-input bubble) has to remember the rule.
       const {
         sourcePid: source_pid,
         wtHwnd,
@@ -270,7 +274,15 @@ function handleStatePost(req, res, options) {
         editor: (data.editor === "code" || data.editor === "cursor") ? data.editor : null,
         tmuxSocket: normalizeTmuxSocket(data.tmux_socket),
         tmuxClient: normalizeTmuxClient(data.tmux_client),
-      }, remoteProfile);
+      }, remoteProfile, wslSourced);
+      // Intentional exception to the WSL PID strip: per-session automation
+      // eligibility only strips Remote SSH, never WSL, to preserve the pre-fix
+      // user-visible automation. Its trust therefore ends on session timeout,
+      // not process exit (known gap, tracked).
+      const automationAgentPid = stripRemoteProcessMetadata(
+        { agentPid: Number.isFinite(rawAgentPid) && rawAgentPid > 0 ? Math.floor(rawAgentPid) : null },
+        remoteProfile
+      ).agentPid;
       const orcaPaneKey = normalizeOrcaPaneKey(data.orca_pane_key);
       const agentId = agentIdentity.agentId;
       const hasExplicitPermissionLifecycleSession = hasExplicitPermissionLifecycleSessionIdentity(
@@ -292,7 +304,7 @@ function handleStatePost(req, res, options) {
         hookSource: data.hook_source,
         codexOriginator: data.codex_originator,
         codexSource: data.codex_source,
-        agentPid,
+        agentPid: automationAgentPid,
       });
       const reportedSubagentId = agentId === "claude-code"
         ? normalizeSubagentMetadata(data.subagent_id, MAX_SUBAGENT_ID_LENGTH)

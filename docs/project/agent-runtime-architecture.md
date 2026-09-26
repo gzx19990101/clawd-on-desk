@@ -245,7 +245,7 @@ ZCode 状态同步与权限审批（hook-only，config.json）：
 opencode 状态同步（in-process plugin，~0ms 延迟）：
   opencode 触发事件（session.created / session.status / message.part.updated 等）
     → hooks/opencode-plugin/index.mjs（CLI/TUI 运行于 Bun；Desktop sidecar 运行于 Electron utilityProcess / Node）
-    → translateEvent 映射（opencode v2 事件名 → PascalCase Clawd event 名）
+    → translateEvent 映射（opencode v1.18 BusEvent 事件名 → PascalCase Clawd event 名；opencode 2.x 见 Plugin Notes 的 v2 节）
     → session.created 的 event.properties.info.parentID 会被记录为 child → parent 映射，child 状态上报带 headless: true
     → fire-and-forget HTTP POST 127.0.0.1:23333/state
     → 同上状态机（agent_id: opencode）
@@ -268,6 +268,7 @@ opencode 托管 generation 注册（#1026）：
           manifest.json
           <agentId>-plugin/{index.mjs,package.json}
           opencode-family-plugin/{core.mjs,session-ids.mjs}
+          [<agentId>-plugin-v2/index.mjs]   // opencode only (#1039)
   数据流：Settings Install / startup sync / CLI install / Doctor Repair
     → opencode-family-install 解析 target（canonicalizeTargetPath 是唯一路径身份）
     → 取 target-scoped mutation lock
@@ -383,6 +384,20 @@ DeepSeek Harness 权限气泡（approval waterfall，阻塞）：
     → 同上状态机（CLAWD_REMOTE=1 + CLAWD_SSH_REMOTE=1，跳过远端 PID 聚焦）
   secure identity 缺失/损坏时 fail closed，不回退 23333-23337 扫描；
   通用本地 /state 与 /permission 不作为 SSH 隧道目标
+
+WSL 状态同步（本机 loopback，但 PID 属于 Linux VM）：
+  WSL 里的 hook 用 Linux `ps` 解析进程字段，又经 127.0.0.1 发到 Windows Clawd；
+  Windows 打开进程时忽略 PID 低两位，所以 Linux PID 可能正好对上无关的本地活进程。
+  服务端按请求自身标记（`wsl_distro` 非空或 `host: "wsl:<distro>"`）剥离与 Remote SSH
+  完全相同的进程字段（sourcePid / wtHwnd / agentPid / pidChain / editor / tmuxSocket / tmuxClient）；
+  `orcaPaneKey` / `cwd` / `host` / `wsl_distro` 保留。
+  清理决策对带 WSL 粘性标记的会话一律不再探测 PID（没有 agent-exit / source-exit /
+  working-source-exit），工作态照常按 working timeout 转 idle，空闲超时后按 `unreachable` 清除；
+  `sessionStaleMs === 0` 时不按年龄删除。
+  因此 WSL 会话没有按进程退出的清理，只按空闲超时清除。
+  per-session 自动化身份用的 agentPid 只按 Remote SSH 剥离（有意的例外，见 server-route-state.js /
+  server-route-permission.js），所以 WSL Codex 的资格与修复前一致；它的会话信任随会话被超时移除而结束，
+  而不是随进程退出（已知缺口，后续跟进）。
 
 权限决策流（Claude Code HTTP hook，阻塞）：
   Claude Code PermissionRequest
@@ -597,6 +612,7 @@ opencode、MiMo Code、OpenClaw、Hermes 和 DeepSeek Harness 是 plugin 形式�
 - `task` 工具会直接新建 session，而不是产出 subtask part；只有 `session.created` 明确带 `event.properties.info.parentID` 的 session 才会被视为 child
 - opencode child session 作为 root 拥有的后台 headless 工作处理：不参与 HUD / focus / 多会话 fanout，`session.idle` 会降级为 `sleeping/SessionEnd`，root session 的 `session.idle` 才映射 `attention/Stop`；MiMo Code 与 opencode 同源，child session 行为一致
 - 由于 `permission.ask` hook 在 opencode 1.3.13 上未被调用，权限只能走 event hook + 反向 bridge；MiMo Code 同源，权限同样走 event hook + 反向 bridge
+- **opencode 2.x（#1039）**：core.mjs 内 `createOpencodeFamilyPluginV2` 产出零 import 的 `{id, setup}` 定义（v2 loader 拒绝函数 default export），由 `hooks/opencode-plugin-v2/` 薄入口与共享 core 组成第 5 个 bundle 文件，installer 注册进 **`plugins` 键**（v1 键不动；v2 容忍旧 `plugin` 键、v1 1.18.32 丢弃 `plugins` 键，双键并存无需版本探测）。事件词汇完全换代：`session.step/reasoning/text/tool/execution.*` + `session.renamed`/`session.usage.updated`，cwd 取事件信封 `location.directory`，未知事件一律忽略。权限用 `ctx.permission.hook("evaluate")` 阻塞 POST `/permission`，决定是响应体 `{decision: allow|always|deny}`（服务端 `hook_source === "opencode-plugin-v2"` 子分支），204/超时/错误一律不改 effect 回原生 ask；allow 配置也进 hook 但绝不降级；v2 上无 reverse bridge。"Always allow" 是插件内 per-session 内存规则。插件在常驻共享 service 中运行：`source_pid`/进程树整组省略（终端跳转降级），更新后需 `opencode service restart`。历史 4 文件 generation 是合法 owned-stale 形态，register 自动迁移
 - plugin 内发出的 POST 必须 fire-and-forget，避免拖慢 TUI
 - 打包后需要把 `app.asar/` 重写为 `app.asar.unpacked/`
 - Hermes plugin 使用同步 POST，避免短命 `hermes -z` 进程退出前丢事件；Clawd 未启动时有短 cooldown，避免反复扫端口

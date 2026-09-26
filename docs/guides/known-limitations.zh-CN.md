@@ -5,6 +5,7 @@
 | 限制 | 说明 |
 |------|------|
 | **Telegram Direct Send：Codex queue 回退** | 已知的本地 Codex Desktop 和 Codex CLI 会话会在已安装 CLI 支持、且 Clawd 能派生出映射会话 store 时使用权威 Codex thread queue。无法派生 store 的 Codex Desktop 会话，或其他符合 queue 条件但 queue 不可用 / 不受支持的投递，会把回复留在剪贴板，不注入文字或 Enter；无法派生 store 的 Windows Codex CLI 会话则保留原有 Console 路径。WSL、远程和其他会话继续沿用原有剪贴板 / Console 语义。对于已存在但当前未加载的 saved thread，Codex 可能先接受持久 queue 条目，直到该 thread 被打开或恢复时才开始 turn；“已排队”只表示 queue 接受了回复，不表示 turn 已启动。HUD / Dashboard 导航仍会打开 Desktop 对话深链接。 |
+| **WSL 会话：没有按进程退出清理** | WSL hook 上报的是 Linux PID，而 Windows 会把这些数字映射到无关的本地进程，所以 Clawd 有意忽略 WSL 会话的 PID 存活探测。WSL 会话不会在 agent 进程退出时立即消失（关终端、`kill` 或崩溃都一样）：正在跑一轮的会话先经过“工作超时”（默认 5 分钟）转为空闲，再过“会话超时（空闲）”（默认 10 分钟）才移除；会话超时（空闲）设为 0 时不按时间移除，要等 agent 上报会话结束。WSL 里的 Codex 会话如果开了“本会话不再询问”，这份信任同样要到会话按上述超时被移除时才结束，而不是在 Codex 退出时结束。 |
 | **Codex CLI：终端跳转是 best-effort** | `request_user_input` 卡片会在 official hook / session metadata 能定位本地窗口时跳回 Codex。仅靠 JSONL 可能拿不到可用终端 PID；Remote SSH 会话也无法从本机聚焦远端窗口，此时卡片只作为只读提醒。 |
 | **Codex CLI：hook 覆盖仍不完整** | Official hooks 已覆盖实时状态和 `PermissionRequest` 观察 / intercept 模式，但不是所有运行时信号都有 hook。Clawd 会保留 JSONL 轮询，用于 hook 被禁用的会话，以及 web search、context compaction、turn aborted 等 fallback-only 状态 / metadata 事件；这些事件仍可能有轮询延迟。审批不再从 JSONL 猜测，必须依赖 official `PermissionRequest` hook。 |
 | **Codex CLI：用户提问卡片只读** | Codex official hook 事件集目前不包含 `request_user_input`。Clawd 从 JSONL transcript 观察它，因此提醒可能有一个轮询周期的延迟。选项和自由输入仍在 Codex 原生界面完成；Clawd 不注入按键，也不会把这些问题变成 Telegram / 飞书可操作审批。 |

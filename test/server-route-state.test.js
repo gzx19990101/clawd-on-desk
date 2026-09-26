@@ -849,6 +849,133 @@ describe("server-route-state POST", () => {
     assert.strictEqual(local.calls.userInputShown[0].agentPid, 4243);
   });
 
+  it("strips WSL process metadata from state updates in both marker forms", async () => {
+    const base = {
+      state: "working",
+      session_id: "sid-wsl",
+      event: "PreToolUse",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      source_pid: 4242,
+      agent_pid: 4243,
+      pid_chain: [1, 4242, 4243],
+      editor: "cursor",
+      tmux_socket: "/tmp/tmux-1000/work",
+      tmux_client: "/dev/pts/7",
+      orca_pane_key: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wt_hwnd: "123456",
+    };
+    const processFields = (res) => {
+      const opts = res.calls.updateSession[0][3];
+      return {
+        sourcePid: opts.sourcePid,
+        agentPid: opts.agentPid,
+        pidChain: opts.pidChain,
+        editor: opts.editor,
+        tmuxSocket: opts.tmuxSocket,
+        tmuxClient: opts.tmuxClient,
+        orcaPaneKey: opts.orcaPaneKey,
+        cwd: opts.cwd,
+        wtHwnd: opts.wtHwnd,
+      };
+    };
+    const strippedFields = {
+      sourcePid: null,
+      agentPid: null,
+      pidChain: null,
+      editor: null,
+      tmuxSocket: null,
+      tmuxClient: null,
+      // Untouched by the gate: opaque labels, not handles on a local process.
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: null,
+    };
+
+    const byDistro = await callStatePost(JSON.stringify({ ...base, wsl_distro: "Ubuntu" }));
+    assert.strictEqual(byDistro.statusCode, 200);
+    assert.deepStrictEqual(processFields(byDistro), strippedFields);
+    assert.strictEqual(byDistro.calls.updateSession[0][3].wslDistro, "Ubuntu");
+    assert.strictEqual(byDistro.calls.updateSession[0][3].host, null);
+
+    const byHost = await callStatePost(JSON.stringify({ ...base, host: "wsl:Ubuntu" }));
+    assert.strictEqual(byHost.statusCode, 200);
+    assert.deepStrictEqual(processFields(byHost), strippedFields);
+    assert.strictEqual(byHost.calls.updateSession[0][3].host, "wsl:Ubuntu");
+    assert.strictEqual(byHost.calls.updateSession[0][3].wslDistro, null);
+
+    // Regression: a local request without a WSL marker stays bit-for-bit unchanged.
+    const local = await callStatePost(JSON.stringify(base));
+    assert.strictEqual(local.statusCode, 200);
+    assert.deepStrictEqual(processFields(local), {
+      sourcePid: 4242,
+      agentPid: 4243,
+      pidChain: [1, 4242, 4243],
+      editor: "cursor",
+      tmuxSocket: "/tmp/tmux-1000/work",
+      tmuxClient: "/dev/pts/7",
+      orcaPaneKey: "tab-9:leaf-3",
+      cwd: "/home/user/repo",
+      wtHwnd: "123456",
+    });
+  });
+
+  it("keeps WSL PIDs out of the Codex user-input bubble too", async () => {
+    const body = JSON.stringify({
+      state: "notification",
+      session_id: "codex:wsl-pid",
+      event: "CodexUserInputRequest",
+      agent_id: "codex",
+      source_pid: 4242,
+      agent_pid: 4243,
+      cwd: "/home/user/repo",
+      wsl_distro: "Ubuntu",
+      codex_user_input: {
+        phase: "request",
+        call_id: "call_wsl_pid",
+        questions: [{
+          id: "scope",
+          header: "Scope",
+          question: "Which scope?",
+          options: [{ label: "Focused", description: "One module" }],
+        }],
+      },
+    });
+
+    const res = await callStatePost(body);
+    assert.strictEqual(res.calls.userInputShown[0].sourcePid, null);
+    assert.strictEqual(res.calls.userInputShown[0].agentPid, null);
+    assert.strictEqual(res.calls.userInputShown[0].cwd, "/home/user/repo");
+  });
+
+  it("keeps WSL markers from changing Codex per-session automation eligibility", async () => {
+    const sessionId = "codex:019f9c87-23a9-7d03-a7ac-c11e3270c3b8";
+    const body = {
+      state: "working",
+      session_id: sessionId,
+      event: "PreToolUse",
+      agent_id: "codex",
+      hook_source: "codex-official",
+      agent_pid: 777,
+      codex_originator: "codex-tui",
+      codex_source: "cli",
+      wsl_distro: "Ubuntu",
+      host: "wsl:Ubuntu",
+    };
+
+    const wsl = await callStatePost(JSON.stringify(body));
+    const opts = wsl.calls.updateSession[0][3];
+    assert.deepStrictEqual(
+      opts.sessionAutomationIdentity,
+      { eligible: true, reason: "eligible" }
+    );
+    // The automation identity path and the session process metadata path are
+    // deliberately separate: the WSL PID is stripped from the session but not
+    // from the automation eligibility input.
+    assert.strictEqual(opts.agentPid, null);
+  });
+
   it("drops archived local Codex lifecycle and passive user-input while keeping quota (#655)", async () => {
     const suppressedRaw = "codex:archived-1";
     const isArchived = (raw) => raw === suppressedRaw;
