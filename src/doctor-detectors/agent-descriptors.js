@@ -381,6 +381,7 @@ const AGENT_DESCRIPTORS = Object.freeze([
     eventSource: agentEventSource("qoder"),
     parentDir: qoder.DEFAULT_PARENT_DIR,
     configPath: qoder.DEFAULT_CONFIG_PATH,
+    configTargets: qoder.DEFAULT_CONFIG_TARGETS,
     configMode: "file",
     autoInstall: true,
     marker: qoder.MARKER,
